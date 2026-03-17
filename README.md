@@ -5,6 +5,8 @@
 This plugin adds a **Termius‑style two‑pane SFTP file manager** to [Tabby](https://tabby.sh).
 It integrates directly with your existing SSH tabs and uses Tabby's native SFTP backend.
 
+If you find this useful, please **star the repo**: [growingupfirst/tabby-sftp-ui](https://github.com/growingupfirst/tabby-sftp-ui)
+
 ### Features
 
 - **SFTP‑UI button in terminal toolbar** – opens the SFTP manager for the active SSH session.
@@ -122,8 +124,13 @@ Then restart Tabby.
 - Optional inline file editor for small text files.
 - Configurable keyboard shortcuts for common actions.
 
-### License
+### Changelog
 
-MIT — see `LICENSE`.
+- **0.2.0**
+  - UI: removed the main toolbar SFTP icon next to Settings (terminal button remains).
+- **0.1.0**
+  - Initial release.
 
+### Problems
+ - When reopening Tabby, the SFTP UI tabs are blank. Please contact me in [Telegram](https://t.me/Gr0w1ngUp) if you know how to fix this.
 

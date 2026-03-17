@@ -1,10 +1,9 @@
 import { CommonModule } from '@angular/common'
 import { FormsModule } from '@angular/forms'
 import { NgModule } from '@angular/core'
-import { HotkeyProvider, TabContextMenuItemProvider, ToolbarButtonProvider } from 'tabby-core'
+import { HotkeyProvider, TabContextMenuItemProvider } from 'tabby-core'
 import { TerminalDecorator } from 'tabby-terminal'
 
-import { SftpToolbarButtons } from './sftp-toolbar-buttons'
 import { SftpManagerTabComponent } from './sftp-manager-tab.component'
 import { SftpContextMenuProvider } from './sftp-context-menu'
 import { SftpUiHotkeyProvider } from './sftp-hotkey'
@@ -20,7 +19,6 @@ import { SftpTerminalDecorator } from './sftp-terminal-decorator'
     SftpManagerTabComponent,
   ],
   providers: [
-    { provide: ToolbarButtonProvider, useClass: SftpToolbarButtons, multi: true },
     { provide: TabContextMenuItemProvider, useClass: SftpContextMenuProvider, multi: true },
     { provide: HotkeyProvider, useClass: SftpUiHotkeyProvider, multi: true },
     { provide: TerminalDecorator, useClass: SftpTerminalDecorator, multi: true },
