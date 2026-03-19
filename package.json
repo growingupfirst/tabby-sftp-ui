@@ -1,6 +1,6 @@
 {
   "name": "tabby-sftp-ui",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SFTP UI for Tabby (Termius-like file manager).",
   "keywords": [
     "tabby-plugin"

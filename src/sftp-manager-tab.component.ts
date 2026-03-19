@@ -2,6 +2,7 @@ import * as path from 'path'
 import * as os from 'os'
 import * as fs from 'fs/promises'
 import * as fsSync from 'fs'
+import * as crypto from 'crypto'
 
 import { Component, Injector, OnInit, HostListener } from '@angular/core'
 import { AppService, BaseTabComponent, FileTransfer, FileUpload, PlatformService, ProfilesService } from 'tabby-core'
@@ -135,7 +136,7 @@ type DragPayload =
               <input [(ngModel)]="localActionPerms" placeholder="Perms (e.g. 755)" />
             </div>
             <div class="action-buttons">
-              <button (click)="localRename()" [disabled]="selectedLocal.length !== 1 || !localActionName">Rename</button>
+              <button (click)="localRename()" [disabled]="selectedLocal.length !== 1">Rename</button>
               <button (click)="refreshLocal()">Refresh</button>
               <button (click)="localDelete()" [disabled]="!selectedLocal.length">Delete</button>
               <button (click)="localNewFolder()">New Folder</button>
@@ -236,7 +237,7 @@ type DragPayload =
               <input [(ngModel)]="remoteActionPerms" placeholder="Perms (e.g. 755)" />
             </div>
             <div class="action-buttons">
-              <button (click)="remoteRename()" [disabled]="selectedRemote.length !== 1 || !remoteActionName">Rename</button>
+              <button (click)="remoteRename()" [disabled]="selectedRemote.length !== 1">Rename</button>
               <button (click)="refreshRemote()" [disabled]="!connected">Refresh</button>
               <button (click)="remoteDelete()" [disabled]="!selectedRemote.length">Delete</button>
               <button (click)="remoteNewFolder()" [disabled]="!connected">New Folder</button>
@@ -280,6 +281,22 @@ type DragPayload =
           <div class="delete-buttons">
             <button class="danger" (click)="confirmDelete()">Delete</button>
             <button (click)="cancelDelete()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="delete-overlay" *ngIf="inputDialogVisible">
+        <div class="delete-dialog" (click)="$event.stopPropagation()">
+          <div class="delete-text">{{ inputDialogTitle }}</div>
+          <input
+            class="dialog-input"
+            [(ngModel)]="inputDialogValue"
+            [placeholder]="inputDialogPlaceholder"
+            (keyup.enter)="confirmInputDialog()"
+          />
+          <div class="delete-buttons">
+            <button class="danger" (click)="confirmInputDialog()" [disabled]="!inputDialogValue.trim()">OK</button>
+            <button (click)="cancelInputDialog()">Cancel</button>
           </div>
         </div>
       </div>
@@ -363,6 +380,7 @@ type DragPayload =
     .delete-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 20; }
     .delete-dialog { min-width: 260px; max-width: 360px; padding: 14px 16px; border-radius: 10px; background: rgba(20,20,20,0.96); border: 1px solid rgba(255,255,255,0.15); box-shadow: 0 18px 45px rgba(0,0,0,0.75); display: flex; flex-direction: column; gap: 10px; }
     .delete-text { font-size: 13px; }
+    .dialog-input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18); background: rgba(0,0,0,0.3); color: inherit; font-size: 13px; }
     .delete-buttons { display: flex; justify-content: flex-end; gap: 8px; }
     .delete-buttons .danger { background: rgba(255,80,80,0.85); border-color: rgba(255,120,120,0.85); }
     .local-menu { position: absolute; min-width: 180px; max-width: 260px; max-height: 260px; overflow-y: auto; padding: 4px 0; border-radius: 10px; background: rgba(18,18,22,0.98); border: 1px solid rgba(255,255,255,0.16); box-shadow: 0 18px 45px rgba(0,0,0,0.8); z-index: 30; backdrop-filter: blur(12px); }
@@ -446,8 +464,24 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   deleteConfirmText = ''
   private pendingLocalDelete: LocalEntry[] = []
   private pendingRemoteDelete: SFTPFile[] = []
+
+  inputDialogVisible = false
+  inputDialogTitle = ''
+  inputDialogPlaceholder = ''
+  inputDialogValue = ''
+  private inputDialogMode: 'local-new-folder' | 'remote-new-folder' | 'local-rename' | 'remote-rename' | null = null
+  private inputDialogTargetPath: string | null = null
+  private inputDialogRemotePath: string | null = null
   private platform!: PlatformService
-  private openedRemoteFiles: Map<string, { remotePath: string, mode: number, watcher: fsSync.FSWatcher | null }> = new Map()
+  private openedRemoteFiles: Map<string, {
+    remotePath: string
+    mode: number
+    watcher: fsSync.FSWatcher | null
+    debounceTimer: number | null
+    syncing: boolean
+    pending: boolean
+    lastUploadedSignature: string | null
+  }> = new Map()
   localPathPresets: Array<{ id: string, label: string, path: string }> = []
   localFavorites: Array<{ id: string, label: string, path: string }> = []
   recentProfiles: any[] = []
@@ -786,6 +820,25 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
       return
     }
 
+    // Drag & drop from OS file manager (Explorer/Finder) into the remote pane
+    const dtFiles = Array.from(ev.dataTransfer?.files ?? [])
+    if (dtFiles.length) {
+      const paths = dtFiles
+        .map(f => (f as any).path as string | undefined)
+        .filter((p): p is string => Boolean(p))
+      if (paths.length) {
+        try {
+          for (const p of paths) {
+            await this.uploadLocalPathToRemote(this.remotePath, p)
+          }
+          await this.refreshRemote()
+        } catch (e) {
+          console.error('[SFTP-UI] Upload from OS drop failed', e)
+        }
+      }
+      return
+    }
+
     const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
     if (!raw) {
       return
@@ -813,6 +866,26 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   async onDropOnLocal (ev: DragEvent): Promise<void> {
     ev.preventDefault()
     this.localDropActive = false
+
+    // Drag & drop from OS file manager into the local pane (copy into current local folder)
+    const dtFiles = Array.from(ev.dataTransfer?.files ?? [])
+    if (dtFiles.length) {
+      const paths = dtFiles
+        .map(f => (f as any).path as string | undefined)
+        .filter((p): p is string => Boolean(p))
+      if (paths.length) {
+        try {
+          for (const p of paths) {
+            await this.copyLocalPathIntoLocalDir(this.localPath, p)
+          }
+          await this.refreshLocal()
+        } catch (e) {
+          console.error('[SFTP-UI] Local copy from OS drop failed', e)
+        }
+      }
+      return
+    }
+
     const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
     if (!raw) {
       return
@@ -838,6 +911,56 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     } catch (e) {
       console.error('[SFTP-UI] Download failed', e)
     }
+  }
+
+  private async uploadLocalPathToRemote (remoteDir: string, localPath: string): Promise<void> {
+    if (!this.sftpSession) {
+      return
+    }
+    const st = await fs.stat(localPath).catch(() => null)
+    if (!st) {
+      return
+    }
+    const baseName = path.basename(localPath)
+    const remoteTarget = path.posix.join(remoteDir, baseName)
+
+    if (st.isDirectory()) {
+      // Ensure destination folder exists, then recursively upload children
+      try {
+        await this.sftpSession.mkdir(remoteTarget)
+      } catch {
+        // ignore (might already exist)
+      }
+      const children = await fs.readdir(localPath)
+      for (const child of children) {
+        await this.uploadLocalPathToRemote(remoteTarget, path.join(localPath, child))
+      }
+      return
+    }
+
+    const upload = new LocalPathFileUpload(localPath)
+    this.trackTransfer(upload, 'upload', remoteTarget, localPath)
+    await this.sftpSession.upload(remoteTarget, upload)
+  }
+
+  private async copyLocalPathIntoLocalDir (destDir: string, srcPath: string): Promise<void> {
+    const st = await fs.stat(srcPath).catch(() => null)
+    if (!st) {
+      return
+    }
+    const baseName = path.basename(srcPath)
+    const destPath = path.join(destDir, baseName)
+
+    if (st.isDirectory()) {
+      await fs.mkdir(destPath, { recursive: true })
+      const children = await fs.readdir(srcPath)
+      for (const child of children) {
+        await this.copyLocalPathIntoLocalDir(destPath, path.join(srcPath, child))
+      }
+      return
+    }
+
+    await fs.copyFile(srcPath, destPath)
   }
 
   getFilteredLocalEntries (): LocalEntry[] {
@@ -1410,18 +1533,17 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   localRename (): void {
-    if (this.selectedLocal.length !== 1 || !this.localActionName?.trim()) {
+    if (this.selectedLocal.length !== 1) {
       return
     }
     const entry = this.selectedLocal[0]
-    const name = this.localActionName.trim()
-    if (name === entry.name) {
-      return
-    }
-    const target = path.join(this.localPath, name)
-    void fs.rename(entry.fullPath, target)
-      .then(() => this.refreshLocal())
-      .catch(e => console.error('[SFTP-UI] Local rename failed', e))
+    this.openInputDialog({
+      mode: 'local-rename',
+      title: 'Rename (local)',
+      placeholder: 'New name',
+      value: entry.name,
+      targetPath: entry.fullPath,
+    })
   }
 
   localDelete (): void {
@@ -1436,14 +1558,13 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   localNewFolder (): void {
-    const name = (this.localActionName || 'New folder').trim()
-    if (!name) {
-      return
-    }
-    const target = path.join(this.localPath, name)
-    void fs.mkdir(target, { recursive: true })
-      .then(() => this.refreshLocal())
-      .catch(e => console.error('[SFTP-UI] Local mkdir failed', e))
+    this.openInputDialog({
+      mode: 'local-new-folder',
+      title: 'New folder (local)',
+      placeholder: 'Folder name',
+      value: 'New folder',
+      targetPath: this.localPath,
+    })
   }
 
   localEditPermissions (): void {
@@ -1468,18 +1589,18 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   remoteRename (): void {
-    if (this.selectedRemote.length !== 1 || !this.remoteActionName?.trim() || !this.sftpSession) {
+    if (this.selectedRemote.length !== 1 || !this.sftpSession) {
       return
     }
     const entry = this.selectedRemote[0]
-    const name = this.remoteActionName.trim()
-    if (name === entry.name) {
-      return
-    }
-    const target = path.posix.join(this.remotePath, name)
-    void this.sftpSession.rename(entry.fullPath, target)
-      .then(() => this.refreshRemote())
-      .catch(e => console.error('[SFTP-UI] Remote rename failed', e))
+    this.openInputDialog({
+      mode: 'remote-rename',
+      title: 'Rename (remote)',
+      placeholder: 'New name',
+      value: entry.name,
+      remotePath: entry.fullPath,
+      targetPath: this.remotePath,
+    })
   }
 
   remoteDelete (): void {
@@ -1497,14 +1618,101 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     if (!this.sftpSession) {
       return
     }
-    const name = (this.remoteActionName || 'New folder').trim()
-    if (!name) {
+    this.openInputDialog({
+      mode: 'remote-new-folder',
+      title: 'New folder (remote)',
+      placeholder: 'Folder name',
+      value: 'New folder',
+      targetPath: this.remotePath,
+    })
+  }
+
+  private openInputDialog (opts: {
+    mode: NonNullable<SftpManagerTabComponent['inputDialogMode']>
+    title: string
+    placeholder: string
+    value: string
+    targetPath: string
+    remotePath?: string
+  }): void {
+    this.inputDialogMode = opts.mode
+    this.inputDialogTitle = opts.title
+    this.inputDialogPlaceholder = opts.placeholder
+    this.inputDialogValue = opts.value
+    this.inputDialogTargetPath = opts.targetPath
+    this.inputDialogRemotePath = opts.remotePath ?? null
+    this.inputDialogVisible = true
+  }
+
+  cancelInputDialog (): void {
+    this.inputDialogVisible = false
+    this.inputDialogMode = null
+    this.inputDialogTitle = ''
+    this.inputDialogPlaceholder = ''
+    this.inputDialogValue = ''
+    this.inputDialogTargetPath = null
+    this.inputDialogRemotePath = null
+  }
+
+  async confirmInputDialog (): Promise<void> {
+    if (!this.inputDialogVisible || !this.inputDialogMode) {
       return
     }
-    const target = path.posix.join(this.remotePath, name)
-    void this.sftpSession.mkdir(target)
-      .then(() => this.refreshRemote())
-      .catch(e => console.error('[SFTP-UI] Remote mkdir failed', e))
+    const mode = this.inputDialogMode
+    const value = this.inputDialogValue.trim()
+    const targetPath = this.inputDialogTargetPath
+    const remotePath = this.inputDialogRemotePath
+    this.cancelInputDialog()
+
+    if (!value || !targetPath) {
+      return
+    }
+
+    try {
+      if (mode === 'local-new-folder') {
+        const dir = targetPath
+        const folderPath = path.join(dir, value)
+        await fs.mkdir(folderPath, { recursive: true })
+        await this.refreshLocal()
+        return
+      }
+
+      if (mode === 'local-rename') {
+        const from = targetPath
+        const to = path.join(this.localPath, value)
+        if (path.basename(from) === value) {
+          return
+        }
+        await fs.rename(from, to)
+        await this.refreshLocal()
+        return
+      }
+
+      if (mode === 'remote-new-folder') {
+        if (!this.sftpSession) {
+          return
+        }
+        const dir = targetPath
+        const folderPath = path.posix.join(dir, value)
+        await this.sftpSession.mkdir(folderPath)
+        await this.refreshRemote()
+        return
+      }
+
+      if (mode === 'remote-rename') {
+        if (!this.sftpSession || !remotePath) {
+          return
+        }
+        const to = path.posix.join(this.remotePath, value)
+        if (path.posix.basename(remotePath) === value) {
+          return
+        }
+        await this.sftpSession.rename(remotePath, to)
+        await this.refreshRemote()
+      }
+    } catch (e) {
+      console.error('[SFTP-UI] Input dialog action failed', e)
+    }
   }
 
   remoteEditPermissions (): void {
@@ -1711,6 +1919,18 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   onKeyDown (event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      if (this.inputDialogVisible) {
+        event.preventDefault()
+        this.cancelInputDialog()
+        return
+      }
+      if (this.deleteConfirmVisible) {
+        event.preventDefault()
+        this.cancelDelete()
+        return
+      }
+    }
     if (event.key === 'Delete' || event.key === 'Backspace') {
       event.preventDefault()
       if (this.selectedRemote.length) {
@@ -1884,7 +2104,9 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     try {
       const tmpRoot = path.join(os.tmpdir(), 'tabby-sftp-ui')
       await fs.mkdir(tmpRoot, { recursive: true })
-      const localPath = path.join(tmpRoot, entry.name)
+      const hash = crypto.createHash('sha1').update(entry.fullPath).digest('hex').slice(0, 10)
+      const safeName = entry.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      const localPath = path.join(tmpRoot, `${hash}-${safeName}`)
 
       // если уже есть watcher на этот файл – закроем его и перезапишем
       const existing = this.openedRemoteFiles.get(localPath)
@@ -1895,23 +2117,74 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
           // ignore
         }
       }
+      if (existing?.debounceTimer != null) {
+        try {
+          clearTimeout(existing.debounceTimer)
+        } catch {
+          // ignore
+        }
+      }
 
       const dl = new LocalPathFileDownload(localPath, entry.mode, entry.size)
       this.trackTransfer(dl, 'download', entry.fullPath, localPath)
       await this.sftpSession.download(entry.fullPath, dl)
 
       // настроим наблюдение за изменениями локального файла
+      const schedule = () => this.scheduleSyncBackRemoteFile(localPath)
       const watcher = fsSync.watch(localPath, { persistent: false }, (eventType) => {
-        if (eventType === 'change') {
-          void this.syncBackRemoteFile(localPath)
+        // Many editors save atomically (rename) or emit multiple change events.
+        if (eventType === 'change' || eventType === 'rename') {
+          schedule()
         }
       })
-      this.openedRemoteFiles.set(localPath, { remotePath: entry.fullPath, mode: entry.mode, watcher })
+      this.openedRemoteFiles.set(localPath, {
+        remotePath: entry.fullPath,
+        mode: entry.mode,
+        watcher,
+        debounceTimer: null,
+        syncing: false,
+        pending: false,
+        lastUploadedSignature: null,
+      })
 
       this.platform.openPath(localPath)
     } catch (e) {
       console.error('[SFTP-UI] Open remote file failed', e)
     }
+  }
+
+  private scheduleSyncBackRemoteFile (localPath: string): void {
+    const info = this.openedRemoteFiles.get(localPath)
+    if (!info) {
+      return
+    }
+    if (info.debounceTimer != null) {
+      clearTimeout(info.debounceTimer)
+    }
+    // Debounce a burst of editor save events
+    info.debounceTimer = window.setTimeout(() => {
+      info.debounceTimer = null
+      void this.syncBackRemoteFile(localPath)
+    }, 650)
+  }
+
+  private async waitForStableLocalFile (localPath: string): Promise<{ size: number, mtimeMs: number } | null> {
+    // Wait until the file stops changing (editors often write in multiple passes)
+    let last: { size: number, mtimeMs: number } | null = null
+    for (let i = 0; i < 10; i++) {
+      const st = await fs.stat(localPath).catch(() => null)
+      if (!st || !st.isFile()) {
+        return null
+      }
+      const cur = { size: st.size, mtimeMs: st.mtimeMs }
+      if (last && cur.size === last.size && cur.mtimeMs === last.mtimeMs) {
+        // stable for one interval
+        return cur
+      }
+      last = cur
+      await new Promise(resolve => setTimeout(resolve, 180))
+    }
+    return last
   }
 
   private async syncBackRemoteFile (localPath: string): Promise<void> {
@@ -1922,13 +2195,33 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     if (!info) {
       return
     }
+    if (info.syncing) {
+      info.pending = true
+      return
+    }
+    info.syncing = true
     try {
+      const stable = await this.waitForStableLocalFile(localPath)
+      if (!stable) {
+        return
+      }
+      const signature = `${stable.size}:${stable.mtimeMs}`
+      if (info.lastUploadedSignature === signature) {
+        return
+      }
       const upload = new LocalPathFileUpload(localPath)
       this.trackTransfer(upload, 'upload', info.remotePath, localPath)
       await this.sftpSession.upload(info.remotePath, upload)
+      info.lastUploadedSignature = signature
       await this.refreshRemote()
     } catch (e) {
       console.error('[SFTP-UI] Sync-back remote file failed', e)
+    } finally {
+      info.syncing = false
+      if (info.pending) {
+        info.pending = false
+        this.scheduleSyncBackRemoteFile(localPath)
+      }
     }
   }
 }

@@ -126,6 +126,12 @@ Then restart Tabby.
 
 ### Changelog
 
+- See [`CHANGELOG.md`](CHANGELOG.md)
+
+- **0.2.1**
+  - Fix: New Folder/Rename input dialog
+  - Fix: Robust remote file edit sync-back
+  - Feature: OS drag-and-drop into panes
 - **0.2.0**
   - UI: removed the main toolbar SFTP icon next to Settings (terminal button remains).
 - **0.1.0**
