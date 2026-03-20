@@ -21,6 +21,7 @@ type LocalEntry = {
 type DragPayload =
   | { kind: 'local-file', fullPath: string, name: string }
   | { kind: 'remote-file', remotePath: string, name: string, size: number, mode: number }
+  | { kind: 'remote-dir', remotePath: string, name: string }
 
 @Component({
   selector: 'tabby-sftp-manager-tab',
@@ -106,6 +107,16 @@ type DragPayload =
               <span class="name sortable" (click)="setLocalSort('name')">Name</span>
               <span class="size sortable" (click)="setLocalSort('size')">Size</span>
               <span class="date sortable" (click)="setLocalSort('modified')">Modified</span>
+            </div>
+            <div
+              class="entry"
+              *ngIf="canLocalUp()"
+              (dblclick)="localUp()"
+            >
+              <span class="icon">⬆</span>
+              <span class="name">Go up</span>
+              <span class="size"></span>
+              <span class="date"></span>
             </div>
             <div
               class="entry"
@@ -281,6 +292,16 @@ type DragPayload =
           <div class="delete-buttons">
             <button class="danger" (click)="confirmDelete()">Delete</button>
             <button (click)="cancelDelete()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="delete-overlay" *ngIf="replaceConfirmVisible">
+        <div class="delete-dialog">
+          <div class="delete-text">{{ replaceConfirmText }}</div>
+          <div class="delete-buttons">
+            <button class="danger" (click)="confirmReplace()">Replace</button>
+            <button (click)="cancelReplace()">Cancel</button>
           </div>
         </div>
       </div>
@@ -464,6 +485,10 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   deleteConfirmText = ''
   private pendingLocalDelete: LocalEntry[] = []
   private pendingRemoteDelete: SFTPFile[] = []
+
+  replaceConfirmVisible = false
+  replaceConfirmText = ''
+  private replaceConfirmResolve: ((v: boolean) => void) | null = null
 
   inputDialogVisible = false
   inputDialogTitle = ''
@@ -796,17 +821,11 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     ev.dataTransfer?.setData('application/x-tabby-sftp-ui-remote-move', JSON.stringify(movePayload))
 
     // Existing cross-device drag (remote -> local) only for files
-    if (!item.isDirectory) {
-      const payload: DragPayload = {
-        kind: 'remote-file',
-        remotePath: item.fullPath,
-        name: item.name,
-        size: item.size,
-        mode: item.mode,
-      }
-      ev.dataTransfer?.setData('application/x-tabby-sftp-ui', JSON.stringify(payload))
-      ev.dataTransfer?.setData('text/plain', item.fullPath)
-    }
+    const payload: DragPayload = item.isDirectory
+      ? { kind: 'remote-dir', remotePath: item.fullPath, name: item.name }
+      : { kind: 'remote-file', remotePath: item.fullPath, name: item.name, size: item.size, mode: item.mode }
+    ev.dataTransfer?.setData('application/x-tabby-sftp-ui', JSON.stringify(payload))
+    ev.dataTransfer?.setData('text/plain', item.fullPath)
     ev.dataTransfer?.setDragImage?.((ev.target as HTMLElement) ?? document.body, 0, 0)
   }
 
@@ -821,22 +840,39 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
 
     // Drag & drop from OS file manager (Explorer/Finder) into the remote pane
-    const dtFiles = Array.from(ev.dataTransfer?.files ?? [])
-    if (dtFiles.length) {
-      const paths = dtFiles
-        .map(f => (f as any).path as string | undefined)
-        .filter((p): p is string => Boolean(p))
-      if (paths.length) {
-        try {
-          for (const p of paths) {
-            await this.uploadLocalPathToRemote(this.remotePath, p)
+    const osPaths = this.getDroppedOsPaths(ev)
+    if (osPaths.length) {
+      try {
+        for (const p of osPaths) {
+          const baseName = path.basename(p)
+          const existing = this.remoteEntries.find(e => e.name === baseName)
+          if (existing) {
+            const ok = await this.showReplaceConfirm(`Replace existing "${baseName}" on remote?`)
+            if (!ok) {
+              continue
+            }
+            const remoteTarget = path.posix.join(this.remotePath, baseName)
+            await this.deleteRemotePathRecursive(remoteTarget)
           }
-          await this.refreshRemote()
-        } catch (e) {
-          console.error('[SFTP-UI] Upload from OS drop failed', e)
+          await this.uploadLocalPathToRemote(this.remotePath, p)
         }
+        await this.refreshRemote()
+      } catch (e) {
+        console.error('[SFTP-UI] Upload from OS drop failed', e)
       }
       return
+    }
+
+    // Fallback: use Tabby's native drag parser (supports directories and HTMLFileUpload)
+    try {
+      const dirUpload = await (this.platform as any).startUploadFromDragEvent?.(ev, true)
+      if (dirUpload && this.sftpSession) {
+        await this.uploadDirectoryUploadToRemote(this.remotePath, dirUpload)
+        await this.refreshRemote()
+        return
+      }
+    } catch (e) {
+      console.error('[SFTP-UI] startUploadFromDragEvent failed', e)
     }
 
     const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
@@ -854,6 +890,14 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
     try {
       const targetRemotePath = path.posix.join(this.remotePath, payload.name)
+      const existsOnRemote = this.remoteEntries.some(e => e.name === payload.name)
+      if (existsOnRemote) {
+        const ok = await this.showReplaceConfirm(`Replace existing "${payload.name}" on remote?`)
+        if (!ok) {
+          return
+        }
+        await this.deleteRemotePathRecursive(targetRemotePath)
+      }
       const upload = new LocalPathFileUpload(payload.fullPath)
       this.trackTransfer(upload, 'upload', targetRemotePath, payload.fullPath)
       await this.sftpSession.upload(targetRemotePath, upload)
@@ -867,23 +911,91 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     ev.preventDefault()
     this.localDropActive = false
 
-    // Drag & drop from OS file manager into the local pane (copy into current local folder)
-    const dtFiles = Array.from(ev.dataTransfer?.files ?? [])
-    if (dtFiles.length) {
-      const paths = dtFiles
-        .map(f => (f as any).path as string | undefined)
-        .filter((p): p is string => Boolean(p))
-      if (paths.length) {
+    // 1) Tabby's internal drag (remote -> local download)
+    const rawInternal = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
+    if (rawInternal) {
+      let payload: DragPayload
+      try {
+        payload = JSON.parse(rawInternal) as DragPayload
+      } catch {
+        payload = null as any
+      }
+      if (payload && payload.kind === 'remote-file') {
         try {
-          for (const p of paths) {
-            await this.copyLocalPathIntoLocalDir(this.localPath, p)
+          const targetLocalPath = path.join(this.localPath, payload.name)
+          if (!this.sftpSession) {
+            throw new Error('Not connected')
           }
+          if (fsSync.existsSync(targetLocalPath)) {
+            const ok = await this.showReplaceConfirm(`Replace existing "${payload.name}"?`)
+            if (!ok) {
+              return
+            }
+          }
+          const dl = new LocalPathFileDownload(targetLocalPath, payload.mode, payload.size)
+          this.trackTransfer(dl, 'download', payload.remotePath, targetLocalPath)
+          await this.sftpSession.download(payload.remotePath, dl)
           await this.refreshLocal()
         } catch (e) {
-          console.error('[SFTP-UI] Local copy from OS drop failed', e)
+          console.error('[SFTP-UI] Download failed', e)
         }
+        return
+      }
+
+      if (payload && payload.kind === 'remote-dir') {
+        try {
+          if (!this.sftpSession) {
+            throw new Error('Not connected')
+          }
+          const targetLocalPath = path.join(this.localPath, payload.name)
+          if (fsSync.existsSync(targetLocalPath)) {
+            const ok = await this.showReplaceConfirm(`Replace existing folder "${payload.name}"?`)
+            if (!ok) {
+              return
+            }
+            await this.deleteLocalPathRecursive(targetLocalPath)
+          }
+          await this.downloadRemoteDirectoryRecursive(payload.remotePath, targetLocalPath)
+          await this.refreshLocal()
+        } catch (e) {
+          console.error('[SFTP-UI] Download directory failed', e)
+        }
+        return
+      }
+    }
+
+    // Drag & drop from OS file manager into the local pane (copy into current local folder)
+    const osPaths = this.getDroppedOsPaths(ev)
+    if (osPaths.length) {
+      try {
+        for (const p of osPaths) {
+          const baseName = path.basename(p)
+          const destPath = path.join(this.localPath, baseName)
+          if (fsSync.existsSync(destPath)) {
+            const ok = await this.showReplaceConfirm(`Replace existing "${baseName}"?`)
+            if (!ok) {
+              continue
+            }
+          }
+          await this.copyLocalPathIntoLocalDir(this.localPath, p)
+        }
+        await this.refreshLocal()
+      } catch (e) {
+        console.error('[SFTP-UI] Local copy from OS drop failed', e)
       }
       return
+    }
+
+    // Fallback: use Tabby's native drag parser, then write files to disk
+    try {
+      const dirUpload = await (this.platform as any).startUploadFromDragEvent?.(ev, true)
+      if (dirUpload) {
+        await this.writeDirectoryUploadToLocal(this.localPath, dirUpload)
+        await this.refreshLocal()
+        return
+      }
+    } catch (e) {
+      console.error('[SFTP-UI] startUploadFromDragEvent (local) failed', e)
     }
 
     const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
@@ -896,17 +1008,42 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     } catch {
       return
     }
-    if (payload.kind !== 'remote-file') {
+    if (payload.kind !== 'remote-file' && payload.kind !== 'remote-dir') {
       return
     }
     try {
-      const targetLocalPath = path.join(this.localPath, payload.name)
+      if (payload.kind === 'remote-file') {
+        const targetLocalPath = path.join(this.localPath, payload.name)
+        if (!this.sftpSession) {
+          throw new Error('Not connected')
+        }
+        if (fsSync.existsSync(targetLocalPath)) {
+          const ok = await this.showReplaceConfirm(`Replace existing "${payload.name}"?`)
+          if (!ok) {
+            return
+          }
+          await this.deleteLocalPathRecursive(targetLocalPath)
+        }
+        const dl = new LocalPathFileDownload(targetLocalPath, payload.mode, payload.size)
+        this.trackTransfer(dl, 'download', payload.remotePath, targetLocalPath)
+        await this.sftpSession.download(payload.remotePath, dl)
+        await this.refreshLocal()
+        return
+      }
+
+      // remote-dir -> local-dir (recursive download)
       if (!this.sftpSession) {
         throw new Error('Not connected')
       }
-      const dl = new LocalPathFileDownload(targetLocalPath, payload.mode, payload.size)
-      this.trackTransfer(dl, 'download', payload.remotePath, targetLocalPath)
-      await this.sftpSession.download(payload.remotePath, dl)
+      const targetLocalPath = path.join(this.localPath, payload.name)
+      if (fsSync.existsSync(targetLocalPath)) {
+        const ok = await this.showReplaceConfirm(`Replace existing folder "${payload.name}"?`)
+        if (!ok) {
+          return
+        }
+        await this.deleteLocalPathRecursive(targetLocalPath)
+      }
+      await this.downloadRemoteDirectoryRecursive(payload.remotePath, targetLocalPath)
       await this.refreshLocal()
     } catch (e) {
       console.error('[SFTP-UI] Download failed', e)
@@ -961,6 +1098,142 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
 
     await fs.copyFile(srcPath, destPath)
+  }
+
+  private async uploadDirectoryUploadToRemote (remoteDir: string, dirUpload: any): Promise<void> {
+    if (!this.sftpSession) {
+      return
+    }
+    const childrens: any[] = dirUpload?.getChildrens?.() ?? []
+    for (const item of childrens) {
+      // DirectoryUpload
+      if (typeof item?.getChildrens === 'function') {
+        const name = item.getName?.() || 'folder'
+        const nextRemote = path.posix.join(remoteDir, name)
+        try {
+          await this.sftpSession.mkdir(nextRemote)
+        } catch {
+          // ignore (might already exist)
+        }
+        await this.uploadDirectoryUploadToRemote(nextRemote, item)
+        continue
+      }
+
+      // FileUpload (including HTMLFileUpload)
+      if (typeof item?.read === 'function' && typeof item?.getName === 'function') {
+        const fileUpload = item as FileUpload
+        const name = fileUpload.getName()
+        const targetRemotePath = path.posix.join(remoteDir, name)
+        this.trackTransfer(fileUpload as any, 'upload', targetRemotePath, name)
+        await this.sftpSession.upload(targetRemotePath, fileUpload as any)
+      }
+    }
+  }
+
+  private async writeDirectoryUploadToLocal (localDir: string, dirUpload: any): Promise<void> {
+    const childrens: any[] = dirUpload?.getChildrens?.() ?? []
+    for (const item of childrens) {
+      if (typeof item?.getChildrens === 'function') {
+        const name = item.getName?.() || 'folder'
+        const nextLocal = path.join(localDir, name)
+        await fs.mkdir(nextLocal, { recursive: true })
+        await this.writeDirectoryUploadToLocal(nextLocal, item)
+        continue
+      }
+
+      if (typeof item?.readAll === 'function' && typeof item?.getName === 'function') {
+        const name = item.getName()
+        const targetLocal = path.join(localDir, name)
+        const buf = await item.readAll()
+        await fs.writeFile(targetLocal, Buffer.from(buf))
+        try {
+          item.close?.()
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  private async downloadRemoteDirectoryRecursive (remoteDir: string, localDir: string): Promise<void> {
+    if (!this.sftpSession) {
+      return
+    }
+    await fs.mkdir(localDir, { recursive: true })
+    const entries = await this.sftpSession.readdir(remoteDir).catch(() => null as any)
+    if (!entries) {
+      return
+    }
+    for (const e of entries as SFTPFile[]) {
+      const targetLocal = path.join(localDir, e.name)
+      if (e.isDirectory) {
+        await this.downloadRemoteDirectoryRecursive(e.fullPath, targetLocal)
+      } else {
+        const dl = new LocalPathFileDownload(targetLocal, e.mode, e.size)
+        this.trackTransfer(dl, 'download', e.fullPath, targetLocal)
+        await this.sftpSession.download(e.fullPath, dl)
+      }
+    }
+  }
+
+  private getDroppedOsPaths (ev: DragEvent): string[] {
+    const dt = ev.dataTransfer
+    if (!dt) {
+      return []
+    }
+    const isWin = os.platform() === 'win32'
+    const isLocalPath = (p: string): boolean => {
+      if (isWin) {
+        return /^[A-Za-z]:\\/.test(p) || p.startsWith('\\\\')
+      }
+      return p.startsWith('/')
+    }
+
+    // 1) Electron-style File.path
+    const filePaths = Array.from(dt.files ?? [])
+      .map(f => (f as any).path as string | undefined)
+      .filter((p): p is string => Boolean(p))
+    if (filePaths.length) {
+      return filePaths
+    }
+
+    // 2) Sometimes paths are exposed as URIs
+    const uriList = dt.getData('text/uri-list') || ''
+    const uris = uriList
+      .split(/\r?\n/g)
+      .map(x => x.trim())
+      .filter(x => x && !x.startsWith('#'))
+      .map(x => {
+        if (x.startsWith('file://')) {
+          try {
+            return decodeURIComponent(x.replace(/^file:\/\//, ''))
+          } catch {
+            return x.replace(/^file:\/\//, '')
+          }
+        }
+        return x
+      })
+      .filter(x => x && isLocalPath(x))
+    if (uris.length) {
+      return uris
+    }
+
+    // 3) Plain text sometimes contains a local path
+    const text = dt.getData('text/plain') || ''
+    const textLines = text.split(/\r?\n/g).map(x => x.trim()).filter(Boolean)
+    const textPaths = textLines
+      .map(x => {
+        if (x.startsWith('file://')) {
+          try {
+            return decodeURIComponent(x.replace(/^file:\/\//, ''))
+          } catch {
+            return x.replace(/^file:\/\//, '')
+          }
+        }
+        return x
+      })
+      .filter(x => x && isLocalPath(x))
+    return textPaths
   }
 
   getFilteredLocalEntries (): LocalEntry[] {
@@ -1919,6 +2192,13 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   onKeyDown (event: KeyboardEvent): void {
+    const target = event.target as HTMLElement | null
+    const isTypingTarget = Boolean(target) && (
+      target?.tagName === 'INPUT' ||
+      target?.tagName === 'TEXTAREA' ||
+      (target as any)?.isContentEditable
+    )
+
     if (event.key === 'Escape') {
       if (this.inputDialogVisible) {
         event.preventDefault()
@@ -1930,8 +2210,17 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
         this.cancelDelete()
         return
       }
+      if (this.replaceConfirmVisible) {
+        event.preventDefault()
+        this.cancelReplace()
+        return
+      }
     }
     if (event.key === 'Delete' || event.key === 'Backspace') {
+      // Don't intercept Delete/Backspace while typing in inputs
+      if (isTypingTarget) {
+        return
+      }
       event.preventDefault()
       if (this.selectedRemote.length) {
         this.remoteDelete()
@@ -2007,6 +2296,40 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     this.deleteConfirmText = ''
     this.pendingLocalDelete = []
     this.pendingRemoteDelete = []
+  }
+
+  private async showReplaceConfirm (text: string): Promise<boolean> {
+    if (this.replaceConfirmVisible) {
+      // Prevent stacking multiple confirmations; choose the latest replacement intent.
+      return false
+    }
+    this.replaceConfirmText = text
+    this.replaceConfirmVisible = true
+    return new Promise(resolve => {
+      this.replaceConfirmResolve = resolve
+    })
+  }
+
+  async confirmReplace (): Promise<void> {
+    if (!this.replaceConfirmVisible) {
+      return
+    }
+    this.replaceConfirmVisible = false
+    const resolve = this.replaceConfirmResolve
+    this.replaceConfirmResolve = null
+    this.replaceConfirmText = ''
+    resolve?.(true)
+  }
+
+  cancelReplace (): void {
+    if (!this.replaceConfirmVisible) {
+      return
+    }
+    this.replaceConfirmVisible = false
+    const resolve = this.replaceConfirmResolve
+    this.replaceConfirmResolve = null
+    this.replaceConfirmText = ''
+    resolve?.(false)
   }
 
   private async deleteLocalEntry (entry: LocalEntry): Promise<void> {

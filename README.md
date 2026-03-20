@@ -128,6 +128,13 @@ Then restart Tabby.
 
 - See [`CHANGELOG.md`](CHANGELOG.md)
 
+- **0.2.3**
+  - Fix: Remote folders drag-and-drop (Remote → Local) works again.
+  - Feature: Replace confirmation is now symmetric (both Local → Remote and Remote → Local).
+  - UI: Added “Go up” row to the Local pane.
+- **0.2.2**
+  - Integrate Tabby’s native `startUploadFromDragEvent` for more reliable OS drag-and-drop (files & folders).
+  - Refine Delete key handling so it works normally inside input dialogs while still triggering delete in lists.
 - **0.2.1**
   - Fix: New Folder/Rename input dialog
   - Fix: Robust remote file edit sync-back
