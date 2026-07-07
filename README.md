@@ -142,6 +142,11 @@ Then restart Tabby.
 
 ### Changelog
 
+- **0.2.6**
+  - Fix: Default remote path now detects Linux and Windows correctly (`/home/user`, `/root`, `/C:/Users/user`, etc.).
+  - Fix: Uploads work immediately after opening SFTP-UI (no need to change directories first).
+  - Fix: Remote path is resolved via SFTP canonicalize, shell CWD, and validated before upload.
+
 - **0.2.5**
   - Fix: SFTP UI tabs are not persisted across Tabby restarts (no more blank tabs when reopening Tabby).
   - Fix: SFTP-UI button is shown only on SSH tabs with an active session (not on local PowerShell/CMD terminals).

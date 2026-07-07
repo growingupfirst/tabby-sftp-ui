@@ -18,6 +18,12 @@ export type SFTPSessionLike = {
   rename: (oldPath: string, newPath: string) => Promise<void>
   upload: (remotePath: string, transfer: import('tabby-core').FileUpload) => Promise<void>
   download: (remotePath: string, transfer: import('tabby-core').FileDownload) => Promise<void>
+  stat?: (p: string) => Promise<{ isDirectory: boolean }>
+}
+
+export type SSHShellSessionLike = {
+  getWorkingDirectory?: () => Promise<string | null>
+  supportsWorkingDirectory?: () => boolean
 }
 
 export type SSHSessionLike = {

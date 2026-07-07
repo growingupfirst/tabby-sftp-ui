@@ -52,6 +52,7 @@ export class SftpUiService {
           inputs: {
             sshSession,
             profile,
+            shellSession: sourceTab?.session ?? null,
           },
         })
         tab.setTitle(`${baseTitle} + SFTP`)

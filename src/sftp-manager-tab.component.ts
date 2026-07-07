@@ -9,7 +9,7 @@ import { AppService, BaseTabComponent, FileTransfer, FileUpload, PlatformService
 import type { RecoveryToken } from 'tabby-core'
 
 import { LocalPathFileDownload, LocalPathFileUpload } from './local-transfers'
-import { SftpConnectionService, SFTPFile, SFTPSessionLike, SSHSessionLike } from './sftp.service'
+import { SftpConnectionService, SFTPFile, SFTPSessionLike, SSHSessionLike, SSHShellSessionLike } from './sftp.service'
 import { SFTP_RECOVERY_TYPE } from './sftp-recovery-provider'
 
 type LocalEntry = {
@@ -177,7 +177,7 @@ type DragPayload =
               />
             </div>
             <div class="pane-actions">
-              <button (click)="remoteUp()" [disabled]="!connected || remotePath === '/'">Up</button>
+              <button (click)="remoteUp()" [disabled]="!connected || !canRemoteUp()">Up</button>
               <button (click)="goToRemotePathInput()" [disabled]="!connected">Go</button>
               <button (click)="refreshRemote()" [disabled]="!connected">Refresh</button>
             </div>
@@ -215,7 +215,7 @@ type DragPayload =
             </div>
             <div
               class="entry"
-              *ngIf="connected && remotePath !== '/'"
+              *ngIf="connected && canRemoteUp()"
               (dblclick)="remoteUp()"
             >
               <span class="icon">⬆</span>
@@ -416,6 +416,7 @@ type DragPayload =
 export class SftpManagerTabComponent extends BaseTabComponent implements OnInit {
   // injected from the SSH tab when opened via SFTP-UI button
   sshSession: SSHSessionLike | null = null
+  shellSession: SSHShellSessionLike | null = null
   profile: any = null
   recoveredStub = false
 
@@ -435,6 +436,7 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   remoteEntries: SFTPFile[] = []
 
   private sftpSession: SFTPSessionLike | null = null
+  private connectPromise: Promise<void> | null = null
 
   localDropActive = false
   remoteDropActive = false
@@ -571,12 +573,34 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     this.remotePathInput = this.remotePath
     this.localPathInput = this.localPath
     if (this.sshSession) {
-      void this.connect()
+      void this.waitForConnection()
     }
     this.loadRecentProfiles()
   }
 
   async connect (): Promise<void> {
+    if (this.connected) {
+      return
+    }
+    if (this.connectPromise) {
+      return this.connectPromise
+    }
+    this.connectPromise = this.connectInternal()
+    try {
+      await this.connectPromise
+    } finally {
+      this.connectPromise = null
+    }
+  }
+
+  private async waitForConnection (): Promise<void> {
+    if (this.connected) {
+      return
+    }
+    await this.connect()
+  }
+
+  private async connectInternal (): Promise<void> {
     if (this.connecting || this.connected) {
       return
     }
@@ -588,14 +612,28 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     try {
       this.sftpSession = await this.sftp.openFromSSHSession(this.sshSession)
       this.connected = true
-      this.remotePath = this.getDefaultRemotePath()
-      this.remotePathInput = this.remotePath
+      await this.initializeRemotePath()
       await this.refreshRemote()
     } catch (e) {
       console.error('[SFTP-UI] SFTP connection failed', e)
+      this.connected = false
+      this.sftpSession = null
     } finally {
       this.connecting = false
     }
+  }
+
+  private async initializeRemotePath (): Promise<void> {
+    this.remotePath = await this.resolveDefaultRemotePath()
+    this.remotePathInput = this.remotePath
+    if (await this.ensureRemoteDirectoryReady()) {
+      return
+    }
+    // Shell CWD may not be ready yet when SFTP-UI opens immediately after SSH connect.
+    await new Promise(resolve => setTimeout(resolve, 500))
+    this.remotePath = await this.resolveDefaultRemotePath()
+    this.remotePathInput = this.remotePath
+    await this.ensureRemoteDirectoryReady()
   }
 
   async disconnect (): Promise<void> {
@@ -619,13 +657,26 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   remoteUp (): void {
-    if (!this.connected || this.remotePath === '/') {
+    if (!this.canRemoteUp()) {
       return
     }
-    const next = path.posix.dirname(this.remotePath)
-    this.remotePath = next === '.' ? '/' : next
+    const next = this.remoteParentPath(this.remotePath)
+    this.remotePath = next
     this.remotePathInput = this.remotePath
     void this.refreshRemote()
+  }
+
+  canRemoteUp (): boolean {
+    if (!this.connected) {
+      return false
+    }
+    if (this.remotePath === '/') {
+      return false
+    }
+    if (this.isWindowsSftpPath(this.remotePath)) {
+      return !/^\/[A-Za-z]:\/?$/.test(this.remotePath)
+    }
+    return true
   }
 
   async refreshLocal (): Promise<void> {
@@ -845,10 +896,12 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   async onDropOnRemote (ev: DragEvent): Promise<void> {
     ev.preventDefault()
     this.remoteDropActive = false
-    if (!this.connected) {
+    await this.waitForConnection()
+    if (!this.connected || !this.sftpSession) {
       return
     }
-    if (!this.sftpSession) {
+    if (!(await this.ensureRemoteDirectoryReady())) {
+      console.error('[SFTP-UI] Remote path is not ready for upload')
       return
     }
 
@@ -1602,6 +1655,9 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   }
 
   getRemoteBreadcrumbs (): Array<{ label: string, path: string }> {
+    if (this.isWindowsSftpPath(this.remotePath)) {
+      return this.getWindowsSftpBreadcrumbs(this.remotePath)
+    }
     const parts = this.remotePath.split('/').filter(Boolean)
     const crumbs: Array<{ label: string, path: string }> = []
     let current = '/'
@@ -1628,9 +1684,7 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     if (!this.connected) {
       return
     }
-    const target = this.normalizeRemotePath(this.remotePathInput || '/')
-    this.remotePath = target
-    this.remotePathInput = target
+    this.syncRemotePathFromInput()
     void this.refreshRemote()
   }
 
@@ -1832,21 +1886,183 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     if (!p) {
       return '/'
     }
-    let result = p.trim()
+    let result = p.trim().replace(/\\/g, '/')
+    const winDrive = result.match(/^\/([A-Za-z]):(?:\/(.*))?$/)
+    if (winDrive) {
+      const rest = winDrive[2] ?? ''
+      return rest
+        ? `/${winDrive[1]}:/${rest}`.replace(/\/+/g, '/')
+        : `/${winDrive[1]}:/`
+    }
+    const bareDrive = result.match(/^([A-Za-z]):(?:\/(.*))?$/)
+    if (bareDrive) {
+      const rest = bareDrive[2] ?? ''
+      return rest
+        ? `/${bareDrive[1]}:/${rest}`.replace(/\/+/g, '/')
+        : `/${bareDrive[1]}:/`
+    }
     if (!result.startsWith('/')) {
       result = '/' + result
     }
-    // remove duplicate slashes
-    result = result.replace(/\/+/g, '/')
-    return result
+    return result.replace(/\/+/g, '/')
   }
 
-  private getDefaultRemotePath (): string {
-    const username = (this.profile && (this.profile.options?.username || this.profile.options?.user)) || ''
-    if (username) {
-      return username === 'root' ? `/root` : `/home/${username}`
+  private async resolveDefaultRemotePath (): Promise<string> {
+    const canonical = await this.canonicalizeRemotePath('.')
+    if (canonical) {
+      const normalized = this.normalizeRemotePath(canonical)
+      if (await this.remotePathExists(normalized)) {
+        return normalized
+      }
     }
+
+    if (this.shellSession) {
+      try {
+        const cwd = await this.shellSession.getWorkingDirectory?.()
+        if (cwd) {
+          const normalized = this.toRemoteSftpPath(cwd)
+          if (await this.remotePathExists(normalized)) {
+            return normalized
+          }
+        }
+      } catch {
+        // fall through to SFTP-based detection
+      }
+    }
+
+    const username = this.getRemoteUsername()
+    for (const candidate of this.buildDefaultRemotePathCandidates(username)) {
+      if (await this.remotePathExists(candidate)) {
+        return candidate
+      }
+    }
+
     return '/'
+  }
+
+  private syncRemotePathFromInput (): void {
+    const normalized = this.normalizeRemotePath(this.remotePathInput || this.remotePath || '/')
+    this.remotePath = normalized
+    this.remotePathInput = normalized
+  }
+
+  private async ensureRemoteDirectoryReady (): Promise<boolean> {
+    if (!this.sftpSession) {
+      return false
+    }
+    this.syncRemotePathFromInput()
+    if (await this.remotePathExists(this.remotePath)) {
+      return true
+    }
+    const resolved = await this.resolveDefaultRemotePath()
+    this.remotePath = resolved
+    this.remotePathInput = resolved
+    return await this.remotePathExists(resolved)
+  }
+
+  private getRemoteUsername (): string {
+    return (this.profile && (this.profile.options?.username || this.profile.options?.user)) || ''
+  }
+
+  private buildDefaultRemotePathCandidates (username: string): string[] {
+    const candidates: string[] = []
+    if (username) {
+      candidates.push(`/C:/Users/${username}`)
+      if (username.toLowerCase() === 'administrator') {
+        candidates.push('/C:/Users/Administrator')
+      }
+      if (username === 'root') {
+        candidates.push('/root')
+      } else {
+        candidates.push(`/home/${username}`)
+      }
+    }
+    candidates.push('/')
+    return candidates
+  }
+
+  private async canonicalizeRemotePath (p: string): Promise<string | null> {
+    const session = this.sftpSession as {
+      sftp?: { canonicalize?: (path: string) => Promise<string>, realpath?: (path: string) => Promise<string> }
+      canonicalize?: (path: string) => Promise<string>
+      realpath?: (path: string) => Promise<string>
+    } | null
+    const candidates = [
+      session?.canonicalize?.bind(session),
+      session?.realpath?.bind(session),
+      session?.sftp?.canonicalize?.bind(session.sftp),
+      session?.sftp?.realpath?.bind(session.sftp),
+    ].filter((fn): fn is (path: string) => Promise<string> => typeof fn === 'function')
+
+    for (const fn of candidates) {
+      try {
+        return await fn(p)
+      } catch {
+        // try the next available SFTP realpath implementation
+      }
+    }
+    return null
+  }
+
+  private async remotePathExists (p: string): Promise<boolean> {
+    if (!this.sftpSession) {
+      return false
+    }
+    try {
+      if (this.sftpSession.stat) {
+        const st = await this.sftpSession.stat(p)
+        return st.isDirectory
+      }
+      await this.sftpSession.readdir(p)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private toRemoteSftpPath (p: string): string {
+    return this.normalizeRemotePath(p)
+  }
+
+  private isWindowsSftpPath (p: string): boolean {
+    return /^\/[A-Za-z]:\//.test(p) || /^\/[A-Za-z]:\/?$/.test(p)
+  }
+
+  private getWindowsSftpBreadcrumbs (remotePath: string): Array<{ label: string, path: string }> {
+    const match = remotePath.match(/^\/([A-Za-z]):\/?(.*)$/)
+    if (!match) {
+      return [{ label: '/', path: '/' }]
+    }
+    const drive = match[1].toUpperCase()
+    const crumbs: Array<{ label: string, path: string }> = [
+      { label: `${drive}:`, path: `/${drive}:/` },
+    ]
+    let current = `/${drive}:/`
+    for (const part of match[2].split('/').filter(Boolean)) {
+      current = `${current}${part}/`
+      crumbs.push({ label: part, path: current.replace(/\/+$/, '') || `/${drive}:/` })
+    }
+    return crumbs
+  }
+
+  private remoteParentPath (p: string): string {
+    if (this.isWindowsSftpPath(p)) {
+      const match = p.match(/^\/([A-Za-z]):\/?(.*)$/)
+      if (!match) {
+        return '/'
+      }
+      const drive = match[1].toUpperCase()
+      const parts = match[2].split('/').filter(Boolean)
+      if (!parts.length) {
+        return '/'
+      }
+      parts.pop()
+      return parts.length
+        ? `/${drive}:/${parts.join('/')}`
+        : `/${drive}:/`
+    }
+    const next = path.posix.dirname(p)
+    return next === '.' ? '/' : next
   }
 
   private loadRecentProfiles (): void {
