@@ -15,7 +15,14 @@ export class SftpTerminalDecorator extends TerminalDecorator {
     super.attach(terminal)
 
     // Best-effort DOM injection: place button near the existing Reconnect button if present.
+    // Only inject for SSH tabs (with a live sshSession property).
     const tryInsert = () => {
+      // Skip for local terminals (PowerShell, CMD, etc.) - only SSH tabs need this button.
+      const sshSession = (terminal as any).sshSession
+      if (!sshSession) {
+        return false
+      }
+
       try {
         const host: HTMLElement | null = terminal.element?.nativeElement ?? null
         if (!host) {
