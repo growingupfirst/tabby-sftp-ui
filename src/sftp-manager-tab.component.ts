@@ -1844,7 +1844,7 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   private getDefaultRemotePath (): string {
     const username = (this.profile && (this.profile.options?.username || this.profile.options?.user)) || ''
     if (username) {
-      return `/home/${username}`
+      return username === 'root' ? `/root` : `/home/${username}`
     }
     return '/'
   }
@@ -2627,4 +2627,3 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
   }
 }
-
