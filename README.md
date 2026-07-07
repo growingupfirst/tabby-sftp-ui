@@ -9,7 +9,7 @@ If you find this useful, please **star the repo**: [growingupfirst/tabby-sftp-ui
 
 ### Features
 
-- **SFTP‑UI button in terminal toolbar** – opens the SFTP manager for the active SSH session.
+- **SFTP‑UI button in terminal toolbar** – opens the SFTP manager for the active SSH session (SSH tabs only; hidden on local terminals).
 - **Two panes** – local filesystem on the left, remote on the right.
 - **Drag & drop**:
   - Between local and remote for uploads/downloads.
@@ -47,15 +47,31 @@ If you find this useful, please **star the repo**: [growingupfirst/tabby-sftp-ui
 
 ### Install
 
-#### From Tabby Plugin Manager (planned)
+#### From npm (recommended)
 
-Once published to the official registry:
+Install the published package into Tabby’s plugins directory:
+
+```bash
+# Windows
+cd "%APPDATA%\tabby\plugins"
+npm install tabby-sftp-ui --legacy-peer-deps
+
+# macOS / Linux
+cd ~/.config/tabby/plugins
+npm install tabby-sftp-ui --legacy-peer-deps
+```
+
+Then **restart Tabby completely** (close all windows and start again).
+
+#### From Tabby Plugin Manager
+
+If your Tabby build supports the plugin manager:
 
 1. Open **Settings → Plugins** in Tabby.
 2. Search for **“tabby-sftp-ui”**.
 3. Click **Install**, then restart Tabby.
 
-#### Manual install (current)
+#### Manual install from source
 
 1. Clone this repository:
 
@@ -127,7 +143,9 @@ Then restart Tabby.
 ### Changelog
 
 - **0.2.5**
-  - Fix: SFTP UI tabs are not persisted across Tabby restarts. (Blank tabs when reopening Tabby)
+  - Fix: SFTP UI tabs are not persisted across Tabby restarts (no more blank tabs when reopening Tabby).
+  - Fix: SFTP-UI button is shown only on SSH tabs with an active session (not on local PowerShell/CMD terminals).
+  - Fix: Default remote path for the `root` user is `/root` instead of `/home/root`.
 
 - **0.2.4**
   - Fix: OS drag-and-drop from Explorer
@@ -148,6 +166,6 @@ Then restart Tabby.
 - **0.1.0**
   - Initial release.
 
-### Problems
- - When reopening Tabby, the SFTP UI tabs are blank. Please contact me in [Telegram](https://t.me/Gr0w1ngUp) if you know how to fix this.
+### Feedback
 
+Found a bug or have a feature idea? Open an issue on GitHub or reach out on [Telegram](https://t.me/Gr0w1ngUp).
