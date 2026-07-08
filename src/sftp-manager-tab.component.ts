@@ -5,7 +5,7 @@ import * as fsSync from 'fs'
 import * as crypto from 'crypto'
 
 import { Component, Injector, OnInit, HostListener } from '@angular/core'
-import { AppService, BaseTabComponent, FileTransfer, FileUpload, PlatformService, ProfilesService } from 'tabby-core'
+import { AppService, BaseTabComponent, FileTransfer, FileUpload, HTMLFileUpload, PlatformService, ProfilesService } from 'tabby-core'
 import type { RecoveryToken } from 'tabby-core'
 
 import { LocalPathFileDownload, LocalPathFileUpload } from './local-transfers'
@@ -26,6 +26,15 @@ type DragPayload =
   | { kind: 'remote-file', remotePath: string, name: string, size: number, mode: number }
   | { kind: 'remote-dir', remotePath: string, name: string }
   | { kind: 'remote-paths', paths: Array<{ remotePath: string, name: string, isDirectory: boolean, size?: number, mode?: number }> }
+
+type CapturedDropData = {
+  types: string[]
+  files: File[]
+  osPaths: string[]
+  internalPayload: string
+  localMovePayload: string
+  dirUploadPromise: Promise<any> | null
+}
 
 @Component({
   selector: 'tabby-sftp-manager-tab',
@@ -742,6 +751,9 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
 
   onDragOver (ev: DragEvent): void {
     ev.preventDefault()
+    if (ev.dataTransfer) {
+      ev.dataTransfer.dropEffect = 'copy'
+    }
   }
 
   onLocalMouseDown (entry: LocalEntry, event: MouseEvent): void {
@@ -896,6 +908,8 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
   async onDropOnRemote (ev: DragEvent): Promise<void> {
     ev.preventDefault()
     this.remoteDropActive = false
+    const captured = this.captureDropData(ev)
+
     await this.waitForConnection()
     if (!this.connected || !this.sftpSession) {
       return
@@ -906,10 +920,9 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
 
     // Drag & drop from OS file manager (Explorer/Finder) into the remote pane
-    const osPaths = this.getDroppedOsPaths(ev)
-    if (osPaths.length) {
+    if (captured.osPaths.length) {
       try {
-        for (const p of osPaths) {
+        for (const p of captured.osPaths) {
           const baseName = path.basename(p)
           const existing = this.remoteEntries.find(e => e.name === baseName)
           if (existing) {
@@ -929,10 +942,60 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
       return
     }
 
+    const raw = captured.internalPayload
+    if (raw) {
+      let payload: DragPayload
+      try {
+        payload = JSON.parse(raw) as DragPayload
+      } catch {
+        payload = null as any
+      }
+
+      try {
+        if (payload && payload.kind === 'local-file') {
+          const targetRemotePath = path.posix.join(this.remotePath, payload.name)
+          const existsOnRemote = this.remoteEntries.some(e => e.name === payload.name)
+          if (existsOnRemote) {
+            const ok = await this.showReplaceConfirm(`Replace existing "${payload.name}" on remote?`)
+            if (!ok) {
+              return
+            }
+            await this.deleteRemotePathRecursive(targetRemotePath)
+          }
+          const upload = new LocalPathFileUpload(payload.fullPath)
+          this.trackTransfer(upload, 'upload', targetRemotePath, payload.fullPath)
+          await this.sftpSession.upload(targetRemotePath, upload)
+          await this.refreshRemote()
+          return
+        }
+
+        if (payload && payload.kind === 'local-paths') {
+          for (const p of payload.paths) {
+            const targetRemotePath = path.posix.join(this.remotePath, p.name)
+            const existsOnRemote = this.remoteEntries.some(e => e.name === p.name)
+            if (existsOnRemote) {
+              const ok = await this.showReplaceConfirm(`Replace existing "${p.name}" on remote?`)
+              if (!ok) {
+                continue
+              }
+              await this.deleteRemotePathRecursive(targetRemotePath)
+            }
+            // uploadLocalPathToRemote handles both files and directories
+            await this.uploadLocalPathToRemote(this.remotePath, p.fullPath)
+          }
+          await this.refreshRemote()
+          return
+        }
+      } catch (e) {
+        console.error('[SFTP-UI] Upload failed', e)
+      }
+    }
+
     // Fallback: use Tabby's native drag parser (supports directories and HTMLFileUpload)
     try {
-      const dirUpload = await (this.platform as any).startUploadFromDragEvent?.(ev, true)
-      if (dirUpload && this.sftpSession) {
+      const dirUpload = captured.dirUploadPromise ? await captured.dirUploadPromise : null
+      const childCount = this.countDirectoryUploadItems(dirUpload)
+      if (dirUpload && childCount > 0 && this.sftpSession) {
         await this.uploadDirectoryUploadToRemote(this.remotePath, dirUpload)
         await this.refreshRemote()
         return
@@ -941,63 +1004,25 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
       console.error('[SFTP-UI] startUploadFromDragEvent failed', e)
     }
 
-    const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
-    if (!raw) {
-      return
-    }
-    let payload: DragPayload
-    try {
-      payload = JSON.parse(raw) as DragPayload
-    } catch {
-      return
-    }
-
-    try {
-      if (payload.kind === 'local-file') {
-        const targetRemotePath = path.posix.join(this.remotePath, payload.name)
-        const existsOnRemote = this.remoteEntries.some(e => e.name === payload.name)
-        if (existsOnRemote) {
-          const ok = await this.showReplaceConfirm(`Replace existing "${payload.name}" on remote?`)
-          if (!ok) {
-            return
-          }
-          await this.deleteRemotePathRecursive(targetRemotePath)
+    if (captured.files.length > 0) {
+      try {
+        const uploaded = await this.uploadDroppedFilesToRemote(captured.files, this.remotePath)
+        if (uploaded > 0) {
+          await this.refreshRemote()
         }
-        const upload = new LocalPathFileUpload(payload.fullPath)
-        this.trackTransfer(upload, 'upload', targetRemotePath, payload.fullPath)
-        await this.sftpSession.upload(targetRemotePath, upload)
-        await this.refreshRemote()
-        return
+      } catch (e) {
+        console.error('[SFTP-UI] Blob upload failed', e)
       }
-
-      if (payload.kind === 'local-paths') {
-        for (const p of payload.paths) {
-          const targetRemotePath = path.posix.join(this.remotePath, p.name)
-          const existsOnRemote = this.remoteEntries.some(e => e.name === p.name)
-          if (existsOnRemote) {
-            const ok = await this.showReplaceConfirm(`Replace existing "${p.name}" on remote?`)
-            if (!ok) {
-              continue
-            }
-            await this.deleteRemotePathRecursive(targetRemotePath)
-          }
-          // uploadLocalPathToRemote handles both files and directories
-          await this.uploadLocalPathToRemote(this.remotePath, p.fullPath)
-        }
-        await this.refreshRemote()
-        return
-      }
-    } catch (e) {
-      console.error('[SFTP-UI] Upload failed', e)
     }
   }
 
   async onDropOnLocal (ev: DragEvent): Promise<void> {
     ev.preventDefault()
     this.localDropActive = false
+    const captured = this.captureDropData(ev)
 
     // 1) Tabby's internal drag (remote -> local download)
-    const rawInternal = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
+    const rawInternal = captured.internalPayload
     if (rawInternal) {
       let payload: DragPayload
       try {
@@ -1079,10 +1104,9 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
 
     // Drag & drop from OS file manager into the local pane (copy into current local folder)
-    const osPaths = this.getDroppedOsPaths(ev)
-    if (osPaths.length) {
+    if (captured.osPaths.length) {
       try {
-        for (const p of osPaths) {
+        for (const p of captured.osPaths) {
           const baseName = path.basename(p)
           const destPath = path.join(this.localPath, baseName)
           if (fsSync.existsSync(destPath)) {
@@ -1102,8 +1126,8 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
 
     // Fallback: use Tabby's native drag parser, then write files to disk
     try {
-      const dirUpload = await (this.platform as any).startUploadFromDragEvent?.(ev, true)
-      if (dirUpload) {
+      const dirUpload = captured.dirUploadPromise ? await captured.dirUploadPromise : null
+      if (dirUpload && this.countDirectoryUploadItems(dirUpload) > 0) {
         await this.writeDirectoryUploadToLocal(this.localPath, dirUpload)
         await this.refreshLocal()
         return
@@ -1112,7 +1136,7 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
       console.error('[SFTP-UI] startUploadFromDragEvent (local) failed', e)
     }
 
-    const raw = ev.dataTransfer?.getData('application/x-tabby-sftp-ui')
+    const raw = captured.internalPayload
     if (!raw) {
       return
     }
@@ -1290,11 +1314,89 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
   }
 
+  private getElectronWebUtils (): { getPathForFile: (file: File) => string } | null {
+    try {
+      const electron = require('electron') as { webUtils?: { getPathForFile: (file: File) => string } }
+      return electron?.webUtils ?? null
+    } catch {
+      return null
+    }
+  }
+
+  private countDirectoryUploadItems (dirUpload: any): number {
+    const childrens: any[] = dirUpload?.getChildrens?.() ?? []
+    let count = 0
+    for (const item of childrens) {
+      if (typeof item?.getChildrens === 'function') {
+        count += this.countDirectoryUploadItems(item)
+      } else {
+        count++
+      }
+    }
+    return count
+  }
+
+  private captureDropData (ev: DragEvent): CapturedDropData {
+    const dt = ev.dataTransfer
+    const types = dt ? Array.from(dt.types) : []
+    const files = dt?.files?.length ? Array.from(dt.files) : []
+    const uriList = dt?.getData('text/uri-list') || ''
+    const textPlain = dt?.getData('text/plain') || ''
+    const internalPayload = dt?.getData('application/x-tabby-sftp-ui') || ''
+    const localMovePayload = dt?.getData('application/x-tabby-sftp-ui-local-move') || ''
+    const osPaths = this.resolveDroppedOsPaths(files, uriList, textPlain)
+
+    let dirUploadPromise: Promise<any> | null = null
+    try {
+      const promise = (this.platform as any).startUploadFromDragEvent?.(ev, true)
+      if (promise) {
+        dirUploadPromise = promise
+      }
+    } catch {
+      // ignore
+    }
+
+    return { types, files, osPaths, internalPayload, localMovePayload, dirUploadPromise }
+  }
+
+  private async uploadDroppedFilesToRemote (files: File[], remoteDir: string): Promise<number> {
+    if (!this.sftpSession) {
+      return 0
+    }
+    if (!files.length) {
+      return 0
+    }
+    let uploaded = 0
+    for (const file of files) {
+      const upload = new HTMLFileUpload(file)
+      const name = upload.getName()
+      const existing = this.remoteEntries.find(e => e.name === name)
+      if (existing) {
+        const ok = await this.showReplaceConfirm(`Replace existing "${name}" on remote?`)
+        if (!ok) {
+          continue
+        }
+        const remoteTarget = path.posix.join(remoteDir, name)
+        await this.deleteRemotePathRecursive(remoteTarget)
+      }
+      const targetRemotePath = path.posix.join(remoteDir, name)
+      this.trackTransfer(upload as any, 'upload', targetRemotePath, name)
+      await this.sftpSession.upload(targetRemotePath, upload as any)
+      uploaded++
+    }
+    return uploaded
+  }
+
   private getDroppedOsPaths (ev: DragEvent): string[] {
     const dt = ev.dataTransfer
     if (!dt) {
       return []
     }
+    const files = dt.files?.length ? Array.from(dt.files) : []
+    return this.resolveDroppedOsPaths(files, dt.getData('text/uri-list') || '', dt.getData('text/plain') || '')
+  }
+
+  private resolveDroppedOsPaths (files: File[], uriList: string, textPlain: string): string[] {
     const isWin = os.platform() === 'win32'
     const isLocalPath = (p: string): boolean => {
       if (isWin) {
@@ -1303,17 +1405,36 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
       }
       return p.startsWith('/')
     }
+    const dedupePaths = (paths: string[]): string[] => {
+      return [...new Set(paths)]
+    }
 
-    // 1) Electron-style File.path
-    const filePaths = Array.from(dt.files ?? [])
+    // 1) Electron-style File.path (legacy)
+    const legacyFilePaths = dedupePaths(files
       .map(f => (f as any).path as string | undefined)
-      .filter((p): p is string => Boolean(p))
-    if (filePaths.length) {
-      return filePaths
+      .filter((p): p is string => Boolean(p && isLocalPath(p))))
+    if (legacyFilePaths.length) {
+      return legacyFilePaths
+    }
+
+    // 1b) Electron webUtils.getPathForFile (modern Electron / Tabby)
+    const webUtils = this.getElectronWebUtils()
+    if (webUtils && files.length) {
+      const webUtilsPaths = dedupePaths(files
+        .map(f => {
+          try {
+            return webUtils.getPathForFile(f)
+          } catch {
+            return ''
+          }
+        })
+        .filter(p => p && isLocalPath(p)))
+      if (webUtilsPaths.length) {
+        return webUtilsPaths
+      }
     }
 
     // 2) Sometimes paths are exposed as URIs
-    const uriList = dt.getData('text/uri-list') || ''
     const uris = uriList
       .split(/\r?\n/g)
       .map(x => x.trim())
@@ -1341,8 +1462,7 @@ export class SftpManagerTabComponent extends BaseTabComponent implements OnInit 
     }
 
     // 3) Plain text sometimes contains a local path
-    const text = dt.getData('text/plain') || ''
-    const textLines = text.split(/\r?\n/g).map(x => x.trim()).filter(Boolean)
+    const textLines = textPlain.split(/\r?\n/g).map(x => x.trim()).filter(Boolean)
     const textPaths = textLines
       .map(x => {
         if (x.startsWith('file://')) {

@@ -142,6 +142,10 @@ Then restart Tabby.
 
 ### Changelog
 
+- **0.2.7**
+  - Fix: OS drag-and-drop from Explorer/Finder into the remote pane works reliably on Windows (Electron `webUtils.getPathForFile`, synchronous drop capture).
+  - Fix: Drop data is captured before async connection/path checks so `dataTransfer` is not cleared mid-upload.
+
 - **0.2.6**
   - Fix: Default remote path now detects Linux and Windows correctly (`/home/user`, `/root`, `/C:/Users/user`, etc.).
   - Fix: Uploads work immediately after opening SFTP-UI (no need to change directories first).
